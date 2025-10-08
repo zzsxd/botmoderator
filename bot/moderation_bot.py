@@ -5,7 +5,8 @@ import shlex
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Deque
+from collections import deque, defaultdict
 
 from .config import BotConfig
 from .data_store import ModerationStore
@@ -32,6 +33,16 @@ class ModerationBot:
         # UI message ids for inline menu per admin chat (legacy inline menu)
         self._admin_ui_lock = threading.RLock()
         self._admin_menu_message: Dict[int, int] = {}
+
+        # Message length threshold for auto-moderation
+        self.MAX_MESSAGE_LENGTH = 100
+
+        # Anti-flood settings: max 4 messages per 30 minutes per user in chat
+        self.RL_WINDOW_SECONDS = 30 * 60
+        self.RL_MAX_MESSAGES = 4
+        # chat_id -> user_id -> deque[timestamps]
+        self._rate_buckets: Dict[int, Dict[int, Deque[float]]] = defaultdict(lambda: defaultdict(deque))
+        self._rate_lock = threading.RLock()
 
         # Button labels (RU)
         self.BTN_MENU = "Меню"
@@ -346,20 +357,50 @@ class ModerationBot:
         if chat_type not in ("group", "supergroup"):
             return
 
+        # Anti-flood: enforce per-user message rate in a sliding window
+        user = message.get("from", {})
+        user_id = user.get("id")
+        message_id = message.get("message_id")
+        if user_id is None or message_id is None:
+            return
+        now = time.time()
+        exceeded = False
+        with self._rate_lock:
+            dq = self._rate_buckets[chat_id][user_id]
+            while dq and now - dq[0] > self.RL_WINDOW_SECONDS:
+                dq.popleft()
+            dq.append(now)
+            if len(dq) > self.RL_MAX_MESSAGES:
+                exceeded = True
+        if exceeded:
+            try:
+                self.api.delete_message(chat_id, message_id)
+            except TelegramAPIError as exc:
+                logger.warning("Failed to delete flood message %s in chat %s: %s", message_id, chat_id, exc)
+                return
+            self._send_ephemeral(chat_id, "Не флуди!")
+            return
+
         text = self._extract_text(message)
         if not text:
             return
 
+        # Detect overly long messages
+        is_long = len(text) > self.MAX_MESSAGE_LENGTH
+
+        # Detect forbidden keywords (when configured)
+        matched: List[str] = []
         keywords = self.store.get_keywords(chat_id)
-        if not keywords:
-            return
+        if keywords:
+            text_cf = text.casefold()
+            matched = [kw for kw in keywords if kw.casefold() in text_cf]
 
-        text_cf = text.casefold()
-        matched = [kw for kw in keywords if kw.casefold() in text_cf]
-        if not matched:
-            return
-
-        self._process_violation(message, matched)
+        if is_long or matched:
+            reasons: List[str] = []
+            if is_long:
+                reasons.append(f"сообщение длиннее {self.MAX_MESSAGE_LENGTH} символов")
+            reasons.extend(matched)
+            self._process_violation(message, reasons)
 
     def _process_violation(self, message: Dict[str, Any], matched_keywords: List[str]) -> None:
         chat = message.get("chat", {})
@@ -384,14 +425,11 @@ class ModerationBot:
         detected = matched_keywords[0] if matched_keywords else "запрещенное слово"
         detected_safe = self._escape_html(detected)
         warning_text = (
-            f"{mention_text}, вам вынесено предупреждение за слово «{detected_safe}». "
+            f"{mention_text}, вам вынесено предупреждение за нарушение: «{detected_safe}». "
             f"Пожалуйста, соблюдайте правила чата. Предупреждение {warning_count} из {limit}."
         )
 
-        try:
-            self.api.send_message(chat_id, warning_text, parse_mode=parse_mode)
-        except TelegramAPIError as exc:
-            logger.warning("Failed to send warning message to chat %s: %s", chat_id, exc)
+        self._send_ephemeral(chat_id, warning_text, parse_mode=parse_mode)
 
         if warning_count >= limit:
             self._enforce_ban(chat_id, user_id, user_display, warning_count)
@@ -416,10 +454,7 @@ class ModerationBot:
         self.store.reset_warnings(chat_id, user_id)
 
         ban_text = f"{user_display} заблокирован после {warning_count} предупреждений."
-        try:
-            self.api.send_message(chat_id, ban_text)
-        except TelegramAPIError as exc:
-            logger.warning("Failed to send ban notification to chat %s: %s", chat_id, exc)
+        self._send_ephemeral(chat_id, ban_text)
 
         admin_note = f"Пользователь {user_display} (id={user_id}) заблокирован в чате {chat_id}."
         self._notify_admins(admin_note)
@@ -631,6 +666,34 @@ class ModerationBot:
             self.api.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
         except TelegramAPIError as exc:
             logger.warning("Failed to send message to chat %s: %s", chat_id, exc)
+
+    def _send_ephemeral(self, chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None, parse_mode: Optional[str] = None, ttl_seconds: int = 20) -> None:
+        """Send a message and schedule its deletion after ttl_seconds.
+
+        Используется для сообщений модерации в группах (предупреждения, ответы на флуд).
+        Админ-уведомления и UI через этот метод не отправляются.
+        """
+        try:
+            result = self.api.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
+        except TelegramAPIError as exc:
+            logger.warning("Failed to send ephemeral message to chat %s: %s", chat_id, exc)
+            return
+        try:
+            message_id = int(result.get("message_id")) if isinstance(result, dict) else None
+        except Exception:
+            message_id = None
+        if message_id is None:
+            return
+        def _delete_later() -> None:
+            try:
+                self.api.delete_message(chat_id, message_id)
+            except TelegramAPIError:
+                pass
+            except Exception:
+                logger.debug("Silent ignore: failed to delete ephemeral message %s in chat %s", message_id, chat_id)
+        timer = threading.Timer(ttl_seconds, _delete_later)
+        timer.daemon = True
+        timer.start()
 
     # --- Admin session helpers and keyboard layout ---
     def _set_session(self, chat_id: int, state: str, data: Optional[Dict[str, Any]] = None) -> None:
