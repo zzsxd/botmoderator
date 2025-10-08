@@ -387,6 +387,16 @@ class ModerationBot:
 
         # Detect overly long messages
         is_long = len(text) > self.MAX_MESSAGE_LENGTH
+        if is_long:
+            # For long messages: just delete without warnings/ban and notify with mention
+            try:
+                self.api.delete_message(chat_id, message.get("message_id"))
+            except TelegramAPIError as exc:
+                logger.warning("Failed to delete long message %s in chat %s: %s", message.get("message_id"), chat_id, exc)
+                return
+            mention_text, parse_mode = self._build_mention(message.get("from", {}))
+            self._send_ephemeral(chat_id, f"{mention_text} не флуди !", parse_mode=parse_mode)
+            return
 
         # Detect forbidden keywords (when configured)
         matched: List[str] = []
@@ -395,12 +405,8 @@ class ModerationBot:
             text_cf = text.casefold()
             matched = [kw for kw in keywords if kw.casefold() in text_cf]
 
-        if is_long or matched:
-            reasons: List[str] = []
-            if is_long:
-                reasons.append(f"сообщение длиннее {self.MAX_MESSAGE_LENGTH} символов")
-            reasons.extend(matched)
-            self._process_violation(message, reasons)
+        if matched:
+            self._process_violation(message, matched)
 
     def _process_violation(self, message: Dict[str, Any], matched_keywords: List[str]) -> None:
         chat = message.get("chat", {})
