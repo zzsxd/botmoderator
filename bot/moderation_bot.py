@@ -37,9 +37,9 @@ class ModerationBot:
         # Message length threshold for auto-moderation
         self.MAX_MESSAGE_LENGTH = 100
 
-        # Anti-flood settings: max 4 messages per 30 minutes per user in chat
-        self.RL_WINDOW_SECONDS = 30 * 60
-        self.RL_MAX_MESSAGES = 4
+        # Anti-flood settings (configurable via env): default 10 msgs per 60 seconds
+        self.RL_WINDOW_SECONDS = getattr(config, "rl_window_seconds", 60)
+        self.RL_MAX_MESSAGES = getattr(config, "rl_max_messages", 10)
         # chat_id -> user_id -> deque[timestamps]
         self._rate_buckets: Dict[int, Dict[int, Deque[float]]] = defaultdict(lambda: defaultdict(deque))
         self._rate_lock = threading.RLock()
@@ -369,9 +369,12 @@ class ModerationBot:
             dq = self._rate_buckets[chat_id][user_id]
             while dq and now - dq[0] > self.RL_WINDOW_SECONDS:
                 dq.popleft()
-            dq.append(now)
-            if len(dq) > self.RL_MAX_MESSAGES:
+            # Do not append a new timestamp if already at/over the limit within the window.
+            # This prevents extending the cooldown indefinitely for active users.
+            if len(dq) >= self.RL_MAX_MESSAGES and (dq and now - dq[0] <= self.RL_WINDOW_SECONDS):
                 exceeded = True
+            else:
+                dq.append(now)
         if exceeded:
             try:
                 self.api.delete_message(chat_id, message_id)
@@ -395,7 +398,7 @@ class ModerationBot:
                 logger.warning("Failed to delete long message %s in chat %s: %s", message.get("message_id"), chat_id, exc)
                 return
             mention_text, parse_mode = self._build_mention(message.get("from", {}))
-            self._send_ephemeral(chat_id, f"{mention_text} не флуди !", parse_mode=parse_mode)
+            self._send_ephemeral(chat_id, f"{mention_text}, сообщение слишком длинное. Сократите, пожалуйста.", parse_mode=parse_mode)
             return
 
         # Detect forbidden keywords (when configured)

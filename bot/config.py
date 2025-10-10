@@ -50,6 +50,8 @@ class BotConfig:
     long_poll_timeout: int = 25
     worker_pool_size: int = 4
     storage_path: str = "moderation_state.json"
+    rl_window_seconds: int = 60
+    rl_max_messages: int = 10
 
     @staticmethod
     def from_env(prefix: str = "BOT_") -> "BotConfig":
@@ -69,6 +71,8 @@ class BotConfig:
         long_poll_timeout = _get_int_env(f"{prefix}LONG_POLL_TIMEOUT", 25)
         worker_pool_size = _get_int_env(f"{prefix}WORKER_POOL_SIZE", 6)
         storage_path = os.getenv(f"{prefix}STORAGE_PATH", "moderation_state.json").strip()
+        rl_window_seconds = _get_int_env(f"{prefix}RL_WINDOW_SECONDS", 60)
+        rl_max_messages = _get_int_env(f"{prefix}RL_MAX_MESSAGES", 10)
 
         return BotConfig(
             token=token,
@@ -78,6 +82,8 @@ class BotConfig:
             long_poll_timeout=long_poll_timeout,
             worker_pool_size=worker_pool_size,
             storage_path=storage_path,
+            rl_window_seconds=rl_window_seconds,
+            rl_max_messages=rl_max_messages,
         )
 
 
